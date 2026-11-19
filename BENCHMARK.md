@@ -1,14 +1,16 @@
-# Docker HTTP benchmark and memory regression
+# Docker HTTP wire-cache benchmark
+
+The latest bounded full-wire-cache implementation measures **293,194.666667 microseconds**, mean score **970.666667** and peak forge RSS **16.457 MiB** under the default Docker driver. The aggregate time is 2.1% below the measured 299,502.333333 baseline. **The requested Read target below 550 ms was not achieved:** its three workload medians remain 983.153, 992.980 and 976.751 ms. GC and scheduling remain Go defaults.
 
 The previous local process-driver figures did not predict production behavior. The user reported that commit `f8a4932` scored 918, with `perf_p50_us` 625,003 and 118 speed points, while baseline `3b435a03bf42dc26750afcd6a3c18114462cf545` measured 426,075 microseconds on the server. Those server figures are user-provided; local measurements below are separate.
 
 ## Implementation
 
-`forge-go/main.go` and `main.ts` have exactly the baseline commit's contents. The Go runtime uses its default GC, memory and scheduler policies: no `SetGCPercent`, `SetMemoryLimit`, fixed `GOMAXPROCS`, 64 KiB reader/scratch pools or per-connection response cache. The baseline transport already enables `TCP_NODELAY`, handles persistent HTTP/1.1 connections and writes replies immediately.
+`main.ts` retains the baseline launcher. The Go runtime uses its default GC, memory and scheduler policies: no `SetGCPercent`, `SetMemoryLimit`, fixed `GOMAXPROCS` or large reader/scratch pools. The baseline transport enables `TCP_NODELAY`, handles persistent HTTP/1.1 connections and writes replies immediately. The current wire-cache changes are measured separately below; the earlier `80882e1` measurements used the unmodified baseline `main.go`.
 
 The two retained optimization areas are:
 
-- Issue JSON: each issue's serialized body shares its immutable HTTP response backing bytes. Detail GETs read the per-repository concurrent index, and list GETs concatenate those already-serialized bodies. Each repository retains at most one list query variant, published through an atomic pointer; an issue mutation atomically replaces its detail response and invalidates the list under the repository write lock. Pagination, filtering, sort order, comments and authentication are preserved.
+- Full HTTP wire frames: the repository retains complete status-line/header/JSON bytes for issue lists and details, Git advertisements and v2 ls-refs. Queries retain separate entries, including the request host/path for pagination links. Cache generations are published atomically and invalidated under the repository write lock for mutations through REST, GraphQL, MCP and receive-pack. The limits are 256 entries, a 1 MiB charged budget (key + frame + 128 bytes of metadata allowance per entry), 64 KiB per response and 4 KiB per key. Oversized responses and misses after the cap are served normally. These caps leave room for map/allocator overhead below the requested 2 MiB cache budget. Issue JSON body slices share their canonical response allocation; the old independent sync.Map index and one-variant list cache are removed.
 - Git pack pass-through: receive-pack validates and initially inflates incoming objects to verify their hashes and inspect commits/trees. It owns the request's compressed bytes and retains each non-delta entry's raw slice. Upload-pack hashes those slices and appends them directly to sideband frames, avoiding recompression, repeated decompression and the previous intermediate outgoing pack buffer. Delta objects and server-created objects still use the correct standard-library fallback encoder.
 
 ## Test environment
@@ -36,7 +38,33 @@ All three replay exports matched and L1 regrading reproduced the result. Highest
 
 `perf_p50_us` is the geometric mean of each trial's four workload medians. The grader's aggregate is the arithmetic mean of those three trial values.
 
-## Final candidate
+## Latest full-wire cache: three focused passes
+
+Each pass ran all three practice instances, live and replayed, sequentially through `grade-default.mjs` with the default Docker driver in the same 1 CPU/1024 MiB outer sandbox. The best measured aggregate is pass 3, which is the retained application implementation. A 2.1% aggregate improvement is a small measured margin amid workload timing variation, not a proven production speedup.
+
+| Pass | Mean score | Mean perf_p50_us | Read medians, ms | Peak forge RSS, MiB |
+| --- | ---: | ---: | --- | ---: |
+| 1: bounded repository wire frames | 970 | 297,142.666667 | 936.256 / 921.255 / 953.391 | 17.375 |
+| 2: validated keep-alive cache lookup reuse | 968.333333 | 301,791.666667 | 962.062 / 885.602 / 977.170 | 16.875 |
+| 3: identical validated GET-header parsing reuse | 970.666667 | 293,194.666667 | 983.153 / 992.980 / 976.751 | 16.45703125 |
+
+The final socket shortcut reuses the parsed form only when the **entire buffered header** exactly matches a previously validated bodyless HTTP/1.1 GET. Shorter, partial or changed requests use the normal parser without waiting for the old request's length. Responses still require an unchanged repository generation, unchanged repository-directory epoch, and matching auth/routing inputs. The socket keeps a reference to one existing cached response and a small generation token, never another response copy or an entire detached cache map.
+
+| Final trial | Score | Conformance | MCP | Speed | perf_p50_us | Read, ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 970 | 600 | 200 | 170 | 300,301 | 983.153 |
+| 1 | 971 | 600 | 200 | 171 | 286,737 | 992.980 |
+| 2 | 971 | 600 | 200 | 171 | 292,546 | 976.751 |
+
+Every live trial exited 0. All three replays matched, all stores worked, no trial timed out, and L1 regrading reproduced the result. The state digest stayed `a0e98d49854b961230227867235c8615858e006db3763f341ac6154af1445590`. Final result SHA-256: `78eff134ec5a48b8227855c0fe1157be79d145c1be39b2f27d868dcd4f293de2`. The score's 90% interval is 969.693338 to 971.639996. Model calls and spend: zero.
+
+The six live/replay forge processes' highest observed `VmHWM` was 16,852 KiB, below the requested 25 MiB. No OOM/OOM-kill occurred. Aggregate cgroup `memory.events max` increased by 71,716 during pass 3; `high`, `oom` and `oom_kill` remained zero. As with the earlier measurements, the outer cgroup includes the nested daemon and filesystem cache.
+
+The runner records `forgeUnder25MiB: true`, `medianBelowBaseline: true`, **`readUnder550Ms: false` and `performanceTargetsPassed: false`**. Its exit code checks correctness/replay/RSS; performance targets are reported separately and are not implied by a zero exit code. The requested combination of performance targets remains unmet after three focused passes. Existing full-wire caching on detail reads was already present in `80882e1`; these measurements do not support expecting this cache extension alone to halve the official Read workload's end-to-end time.
+
+Original records are retained in `.local-grade/wire-pass1`, `wire-pass2`, `wire-pass3` and their sibling `.log`/`.resources.json` files. The evaluator and workload source were unchanged. The latest public #1 remains 970 / 305,639 microseconds; our local trial 0 is 970 / 300,301. Host and layout differences preclude claiming an official rank.
+
+## Earlier candidate: commit 80882e1
 
 The final application binaries were graded under `.local-grade/http-final` after removing duplicate retained issue JSON storage:
 
@@ -79,10 +107,12 @@ docker exec forge-http-grade node /bot/scripts/grade-default.mjs --worktree --sa
 docker stop forge-http-grade
 ```
 
-The runner invokes `node /kit/cli/makefun.mjs grade-local --kit /kit --bot /bot --instances 3` plus the provided snapshot/save options, with **no driver argument**. This kit accepts `--bot`, not `--repo`. It saves the official summary, cassettes and state/performance exports, plus a sibling `.log` and `.resources.json`. The resource record includes per-process high-water RSS and cgroup memory events; its exit code also checks full conformance/MCP, matching replays and observed forge RSS below 60 MiB. Generated results stay in the ignored `.local-grade/` directory.
+The runner invokes `node /kit/cli/makefun.mjs grade-local --kit /kit --bot /bot --instances 3` plus the provided snapshot/save options, with **no driver argument**. This kit accepts `--bot`, not `--repo`. It saves the official summary, cassettes and state/performance exports, plus a sibling `.log` and `.resources.json`. The resource record includes per-process high-water RSS and cgroup memory events; its exit code checks full conformance/MCP, matching replays and observed forge RSS below **25 MiB**. Performance-target flags are reported independently. Generated results stay in the ignored `.local-grade/` directory.
 
 ## Verification
 
 `go test ./forge-go` and `go vet ./forge-go` pass. Tests exercise cache invalidation across issue changes, one live keep-alive socket with changing authorization and issue state, raw compressed entry retention despite request-buffer reuse, pack checksums, and sideband framing across object and 64 KiB boundaries. Both static Linux architectures are rebuilt with CGO disabled, `-trimpath` and `-ldflags="-s -w"`.
+
+Wire-cache regressions also cover the 256-entry and byte limits under concurrent publication, rejecting oversized frames, retaining standard list query variants, shared complete-frame allocations for repeated detail/advertisement/ls-refs requests, mutation-vs-publication ordering, repository deletion/recreation, changed credentials, and changed HTTP framing/pipelining.
 
 Transcript bundling remains the submission wrapper's responsibility; a check without the bundle cannot establish transcript eligibility.

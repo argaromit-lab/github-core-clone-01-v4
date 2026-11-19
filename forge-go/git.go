@@ -97,15 +97,19 @@ func (f *forge) git(q request) response {
 			values, _ := url.ParseQuery(q.query)
 			service = values.Get("service")
 		}
-		if service == upload && v2 {
-			return v2Advertisement
-		}
 		if service != upload && service != receive {
 			return notFound
 		}
+		key := refWireKey(service, v2)
+		if cached := r.cachedWire(key); cached != nil {
+			return cached
+		}
 		r.mu.RLock()
 		defer r.mu.RUnlock()
-		return r.advertise(service)
+		if service == upload && v2 {
+			return r.storeWire(key, v2Advertisement)
+		}
+		return r.storeWire(key, r.advertise(service))
 	}
 	if q.method != "POST" {
 		return notFound
@@ -273,6 +277,7 @@ func (r *repository) receive(body []byte) response {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.invalidateWire()
 	objects, err := ingest(body, r.objects)
 	var out []byte
 	if err != nil {
@@ -328,6 +333,16 @@ type fetchArgs struct {
 }
 
 func (r *repository) upload(body []byte, v2 bool) response {
+	var refsKey string
+	if v2 && len(body) < 4096 {
+		first, _, kind := takePacket(body)
+		if kind == 3 && bytes.Equal(bytes.TrimSuffix(first, []byte{'\n'}), []byte("command=ls-refs")) {
+			refsKey = "ls-refs:" + string(body)
+			if cached := r.cachedWire(refsKey); cached != nil {
+				return cached
+			}
+		}
+	}
 	var fetch fetchArgs
 	command := "fetch"
 	if v2 {
@@ -384,7 +399,11 @@ func (r *repository) upload(body []byte, v2 bool) response {
 	if command == "ls-refs" {
 		r.mu.RLock()
 		defer r.mu.RUnlock()
-		return r.lsRefs(prefixes, symrefs, peel, unborn)
+		result := r.lsRefs(prefixes, symrefs, peel, unborn)
+		if refsKey != "" {
+			return r.storeWire(refsKey, result)
+		}
+		return result
 	}
 	if command != "fetch" || len(fetch.wants) == 0 {
 		return badRequest

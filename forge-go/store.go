@@ -19,6 +19,7 @@ type forge struct {
 	mu           sync.RWMutex
 	repos        map[string]*repository
 	nextID       atomic.Int64
+	repoEpoch    atomic.Uint64
 }
 
 type repository struct {
@@ -33,15 +34,7 @@ type repository struct {
 	pulls                            map[int]*pull
 	nextNumber, nextComment          int
 	shallow                          atomic.Pointer[cloneFrame]
-	issueLists                       atomic.Pointer[issueListFrame]
-	readIndex                        sync.Map
-}
-
-// Keep just the latest list variant. Readers load immutable bytes atomically;
-// mutation drops that pointer while holding the repository's write lock.
-type issueListFrame struct {
-	key  string
-	body response
+	wire                             atomic.Pointer[wireFrames]
 }
 
 type issue struct {
@@ -115,6 +108,7 @@ func (f *forge) createRepo(input obj) (int, any) {
 		r.refs["refs/heads/"+branch] = id
 	}
 	f.repos[key] = r
+	f.repoEpoch.Add(1)
 	return 201, r.view()
 }
 
@@ -201,38 +195,41 @@ func (f *forge) rest(q request) response {
 	if len(parts) == 4 {
 		action = parts[3]
 	}
-	if q.method == "GET" && strings.HasPrefix(action, "issues/") && !strings.Contains(action[7:], "/") {
-		n, err := strconv.Atoi(action[7:])
-		if err == nil {
-			if cached, found := r.readIndex.Load(n); found {
-				return cached.(response)
-			}
-		}
-		return notFound
-	}
-	if q.method == "GET" && action == "issues" {
-		cacheKey := q.host + q.path + "?" + q.query
-		if cached := r.issueLists.Load(); cached != nil && cached.key == cacheKey {
-			return cached.body
+	if q.method == "GET" && issueReadAction(action) {
+		cacheKey := issueWireKey(q)
+		if cached := r.cachedWire(cacheKey); cached != nil {
+			return cached
 		}
 		r.mu.RLock()
 		defer r.mu.RUnlock()
-		if cached := r.issueLists.Load(); cached != nil && cached.key == cacheKey {
-			return cached.body
+		if cached := r.cachedWire(cacheKey); cached != nil {
+			return cached
 		}
-		values, _ := url.ParseQuery(q.query)
-		result := r.serializedIssues(q, values)
-		r.issueLists.Store(&issueListFrame{cacheKey, result})
-		return result
+		if action == "issues" {
+			values, _ := url.ParseQuery(q.query)
+			return r.storeWire(cacheKey, r.serializedIssues(q, values))
+		}
+		n, err := strconv.Atoi(action[7:])
+		if err == nil && r.issues[n] != nil {
+			return r.storeWire(cacheKey, r.issues[n].read)
+		}
+		return notFound
 	}
 	if action == "" && q.method == "DELETE" {
+		r.mu.Lock()
+		r.invalidateWire()
+		r.mu.Unlock()
 		f.mu.Lock()
 		delete(f.repos, strings.ToLower(parts[2]))
+		f.repoEpoch.Add(1)
 		f.mu.Unlock()
 		return noContent
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if q.method != "GET" {
+		defer r.invalidateWire()
+	}
 	if action == "" {
 		switch q.method {
 		case "GET":
@@ -521,8 +518,7 @@ func (r *repository) refreshIssue(i *issue) {
 	i.view = r.issueBase(i)
 	i.read = jsonFrame(200, "", i.view)
 	_, i.json, _ = bytes.Cut(i.read, []byte("\r\n\r\n"))
-	r.readIndex.Store(i.number, i.read)
-	r.issueLists.Store(nil)
+	r.invalidateWire()
 }
 
 func (r *repository) serializedIssues(q request, values url.Values) response {
@@ -629,6 +625,7 @@ func (r *repository) createPull(input obj) (int, any) {
 	n := r.nextNumber
 	p := &pull{issue: issue{id: strconv.FormatInt(r.id, 10) + "-" + strconv.Itoa(n), nodeID: globalID("PullRequest", r.id, n), number: n, title: text(input["title"]), body: text(input["body"]), state: "open", labels: []obj{}, comments: []obj{}}, head: head, base: base, headID: headID, baseID: baseID, forkID: r.mergeBase(baseID, headID)}
 	r.pulls[n] = p
+	r.invalidateWire()
 	return 201, r.pullView(p)
 }
 
@@ -738,6 +735,7 @@ func (r *repository) mergePull(p *pull) (int, any) {
 	id := r.commitFiles(files, parent, p.title+"\n\n"+p.body, r.owner)
 	r.refs["refs/heads/"+p.base] = id
 	p.mergeID, p.merged, p.state = id, true, "closed"
+	r.invalidateWire()
 	return 200, obj{"sha": id.String(), "merged": true, "message": "Pull request successfully merged"}
 }
 

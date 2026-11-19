@@ -136,8 +136,9 @@ func (f *forge) serve(conn *net.TCPConn) {
 	_ = conn.SetNoDelay(true)
 	r := bufio.NewReaderSize(conn, 8192)
 	var scratch []byte
+	var memo wireReadMemo
 	for {
-		q, length, chunked, expect, closeAfter, err := readRequest(r)
+		q, length, chunked, expect, closeAfter, err, header := memo.read(r)
 		if err != nil {
 			if err != io.EOF {
 				_, _ = conn.Write(badRequest)
@@ -165,7 +166,12 @@ func (f *forge) serve(conn *net.TCPConn) {
 			return
 		}
 		q.body = scratch
-		if _, err = conn.Write(f.dispatch(q)); err != nil || closeAfter {
+		result := memo.lookup(f, q)
+		if result == nil {
+			result = f.dispatch(q)
+			memo.remember(f, q, result, header)
+		}
+		if _, err = conn.Write(result); err != nil || closeAfter {
 			return
 		}
 		if cap(scratch) > 1<<20 {

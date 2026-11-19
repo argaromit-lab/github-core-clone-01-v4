@@ -26,7 +26,7 @@ npm run practice
 
 The implementation includes protocol-v2 upload-pack, report-status receive-pack, native Git object hashing and pack parsing, shallow/deepening fetches, commit-backed contents and merges, stable GraphQL identities, and Streamable HTTP MCP tools.
 
-The [Linux benchmark report](BENCHMARK.md) documents the return to the baseline transport and default Go GC, bounded serialized issue caches, and compressed Git pack pass-through. It includes default-driver Docker trials, replay checks, forge memory measurements, and commands for reproducing the shared 1 CPU/1024 MiB sandbox.
+The [Linux benchmark report](BENCHMARK.md) documents bounded full HTTP response caches, default Go GC and scheduling, and compressed Git pack pass-through. It includes default-driver Docker trials, replay checks, forge memory measurements, and commands for reproducing the shared 1 CPU/1024 MiB sandbox.
 
 ## License
 

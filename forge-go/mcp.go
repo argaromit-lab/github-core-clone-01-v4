@@ -112,6 +112,7 @@ func (f *forge) callTool(name string, args obj) (any, bool) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.invalidateWire()
 	switch name {
 	case "get_repo":
 		return r.view(), false

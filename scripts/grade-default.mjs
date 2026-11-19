@@ -63,8 +63,15 @@ if (resources.summaryWritten) {
   resources.replaysMatched = summary.agent?.trials?.length === 3 && summary.agent.trials.every((trial) =>
     trial.replay?.verdict?.ok === true && trial.live?.state_sha256 === trial.replay?.state_sha256);
   resources.scores = summary.result?.performance?.scores || null;
-  resources.forgeUnder60MiB = resources.maxForgeRssKiB > 0 && resources.maxForgeRssKiB < 60 * 1024;
-  if (!resources.conformanceAndMcpPassed || !resources.replaysMatched || !resources.forgeUnder60MiB) code = 1;
+  resources.forgeUnder25MiB = resources.maxForgeRssKiB > 0 && resources.maxForgeRssKiB < 25 * 1024;
+  resources.readMediansMs = trials.map((trial) => {
+    const perf = JSON.parse(readFileSync(`${save}/trial-${trial.index}/state/perf.json`, 'utf8'));
+    return perf.workloads.find((workload) => workload.name === 'read')?.p50_ms ?? null;
+  });
+  resources.readUnder550Ms = resources.readMediansMs.length === 3 && resources.readMediansMs.every((ms) => ms !== null && ms < 550);
+  resources.medianBelowBaseline = resources.scores?.perf_p50_us < 299502.333333;
+  resources.performanceTargetsPassed = resources.readUnder550Ms && resources.medianBelowBaseline;
+  if (!resources.conformanceAndMcpPassed || !resources.replaysMatched || !resources.forgeUnder25MiB) code = 1;
 } else {
   code = 1;
 }
