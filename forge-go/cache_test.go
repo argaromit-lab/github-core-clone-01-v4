@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -85,27 +84,30 @@ func TestCachedListsFollowMutations(t *testing.T) {
 	}
 }
 
-func TestConcurrentCachePublishersKeepEveryEntry(t *testing.T) {
-	r := &repository{}
-	var workers sync.WaitGroup
-	for i := 0; i < 64; i++ {
-		workers.Add(1)
-		go func(i int) {
-			defer workers.Done()
-			key := string(rune('A' + i))
-			r.storeFrame(key, response(key))
-		}(i)
+func TestIssueListCacheReusesBytesAndInvalidatesAtomically(t *testing.T) {
+	t.Setenv("MAKEFUN_SHOP_TOKEN", "test-token")
+	t.Setenv("MAKEFUN_FORGE_LOGIN", "adaiversen")
+	f := newForge()
+	apiCall(t, f, "POST", "/user/repos", `{"name":"bounded"}`, 201)
+	path := "/repos/adaiversen/bounded/issues"
+	assertListSize(t, f, path, 0)
+	r := f.repo("adaiversen", "bounded")
+	cached := r.issueLists.Load()
+	assertListSize(t, f, path, 0)
+	if cached == nil || cached != r.issueLists.Load() {
+		t.Fatal("identical list reads did not reuse immutable bytes")
 	}
-	workers.Wait()
-	for i := 0; i < 64; i++ {
-		key := string(rune('A' + i))
-		if string(r.cachedFrame(key)) != key {
-			t.Fatalf("concurrent publisher lost entry %q", key)
-		}
+	apiCall(t, f, "POST", path, `{"title":"New"}`, 201)
+	if r.issueLists.Load() != nil {
+		t.Fatal("mutation did not atomically invalidate the cached list")
 	}
+	if !bytes.HasSuffix(cached.body, []byte("[]")) {
+		t.Fatal("mutation modified an already published response")
+	}
+	assertListSize(t, f, path, 1)
 }
 
-func TestConnectionCacheRevalidatesStoreAndAuthorization(t *testing.T) {
+func TestKeepAliveRevalidatesStoreAndAuthorization(t *testing.T) {
 	t.Setenv("MAKEFUN_SHOP_TOKEN", "test-token")
 	t.Setenv("MAKEFUN_FORGE_LOGIN", "adaiversen")
 	f := newForge()

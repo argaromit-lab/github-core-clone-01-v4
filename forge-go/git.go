@@ -103,18 +103,9 @@ func (f *forge) git(q request) response {
 		if service != upload && service != receive {
 			return notFound
 		}
-		cacheKey := "advertise:" + service
-		if cached := r.cachedFrame(cacheKey); cached != nil {
-			return cached
-		}
 		r.mu.RLock()
 		defer r.mu.RUnlock()
-		if cached := r.cachedFrame(cacheKey); cached != nil {
-			return cached
-		}
-		result := r.advertise(service)
-		r.storeFrame(cacheKey, result)
-		return result
+		return r.advertise(service)
 	}
 	if q.method != "POST" {
 		return notFound
@@ -325,7 +316,6 @@ func (r *repository) receive(body []byte) response {
 	if side {
 		out = sideband(nil, out)
 	}
-	r.invalidateFrames()
 	return gitFrame(receive, "result", out)
 }
 
@@ -338,15 +328,6 @@ type fetchArgs struct {
 }
 
 func (r *repository) upload(body []byte, v2 bool) response {
-	refsKey := ""
-	if v2 {
-		if command, _, kind := takePacket(body); kind == 3 && bytes.Equal(command, []byte("command=ls-refs\n")) {
-			refsKey = "ls-refs:" + string(body)
-			if cached := r.cachedFrame(refsKey); cached != nil {
-				return cached
-			}
-		}
-	}
 	var fetch fetchArgs
 	command := "fetch"
 	if v2 {
@@ -403,16 +384,7 @@ func (r *repository) upload(body []byte, v2 bool) response {
 	if command == "ls-refs" {
 		r.mu.RLock()
 		defer r.mu.RUnlock()
-		if refsKey != "" {
-			if cached := r.cachedFrame(refsKey); cached != nil {
-				return cached
-			}
-		}
-		result := r.lsRefs(prefixes, symrefs, peel, unborn)
-		if refsKey != "" {
-			r.storeFrame(refsKey, result)
-		}
-		return result
+		return r.lsRefs(prefixes, symrefs, peel, unborn)
 	}
 	if command != "fetch" || len(fetch.wants) == 0 {
 		return badRequest
@@ -585,11 +557,6 @@ func (r *repository) fetch(args fetchArgs) response {
 		}
 		out = packet(out, ack)
 	}
-	pack := writePack(toSend)
-	if args.side {
-		out = sideband(out, pack)
-	} else {
-		out = append(out, pack...)
-	}
+	out = appendRawPack(out, toSend, args.side)
 	return gitFrame(upload, "result", out)
 }

@@ -291,7 +291,7 @@ func ingest(pack []byte, existing map[oid]*gitObject) (map[oid]*gitObject, error
 			pending = append(pending, delta)
 			continue
 		}
-		g, err := constructObject(kind, data, pack[start:pos])
+		g, err := constructObject(kind, data, pack[start:pos:pos])
 		if err != nil {
 			return nil, err
 		}
@@ -362,19 +362,63 @@ func (g *gitObject) packEntry() []byte {
 }
 
 func writePack(objects []*gitObject) []byte {
-	n := 32
+	return appendRawPack(nil, objects, false)
+}
+
+// Reuse validated receive-pack entries verbatim. Hash and frame their compressed
+// slices directly, without another inflate/deflate cycle or an intermediate pack.
+func appendRawPack(out []byte, objects []*gitObject, side bool) []byte {
+	remaining := 32
 	for _, g := range objects {
-		n += len(g.packEntry())
+		remaining += len(g.packEntry())
 	}
-	pack := make([]byte, 12, n)
-	copy(pack, "PACK")
-	binary.BigEndian.PutUint32(pack[4:8], 2)
-	binary.BigEndian.PutUint32(pack[8:12], uint32(len(objects)))
+	var header [12]byte
+	copy(header[:], "PACK")
+	binary.BigEndian.PutUint32(header[4:8], 2)
+	binary.BigEndian.PutUint32(header[8:12], uint32(len(objects)))
+	hash := sha1.New()
+	hash.Write(header[:])
 	for _, g := range objects {
-		pack = append(pack, g.encoded...)
+		hash.Write(g.encoded)
 	}
-	sum := sha1.Sum(pack)
-	return append(pack, sum[:]...)
+	var checksum [20]byte
+	hash.Sum(checksum[:0])
+	capacity := remaining
+	if side {
+		capacity += ((remaining+65514)/65515)*5 + len(flush)
+	}
+	if cap(out)-len(out) < capacity {
+		grown := make([]byte, len(out), len(out)+capacity)
+		copy(grown, out)
+		out = grown
+	}
+	bandRemaining := 0
+	appendSlice := func(raw []byte) {
+		if !side {
+			out = append(out, raw...)
+			return
+		}
+		for len(raw) > 0 {
+			if bandRemaining == 0 {
+				bandRemaining = min(remaining, 65515)
+				out = append(pktHeader(out, bandRemaining+5), 1)
+			}
+			n := min(bandRemaining, len(raw))
+			out = append(out, raw[:n]...)
+			raw = raw[n:]
+			bandRemaining -= n
+			remaining -= n
+		}
+	}
+	appendSlice(header[:])
+	for _, g := range objects {
+		appendSlice(g.encoded)
+	}
+	appendSlice(checksum[:])
+	if side {
+		out = append(out, flush...)
+	}
+	return out
 }
 
 func (r *repository) saveObject(kind int, data []byte) oid {

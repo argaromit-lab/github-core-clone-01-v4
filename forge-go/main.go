@@ -14,10 +14,8 @@ import (
 	"net/url"
 	"os"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -31,11 +29,6 @@ type request struct {
 }
 
 type response []byte
-
-var (
-	readerPool  = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 64<<10) }}
-	scratchPool = sync.Pool{New: func() any { return make([]byte, 0, 64<<10) }}
-)
 
 func frame(status int, contentType, headers string, body []byte) response {
 	out := make([]byte, 0, 110+len(contentType)+len(headers)+len(body))
@@ -118,9 +111,6 @@ func (f *forge) authenticated(header string) bool {
 }
 
 func (f *forge) dispatch(q request) response {
-	if q.method != "GET" {
-		defer f.revision.Add(1)
-	}
 	if q.method == "GET" && q.path == "/healthz" {
 		return health
 	}
@@ -144,19 +134,8 @@ func (f *forge) dispatch(q request) response {
 func (f *forge) serve(conn *net.TCPConn) {
 	defer conn.Close()
 	_ = conn.SetNoDelay(true)
-	r := readerPool.Get().(*bufio.Reader)
-	r.Reset(conn)
-	scratch := scratchPool.Get().([]byte)[:0]
-	var previous request
-	var previousResponse response
-	var previousRevision uint64
-	defer func() {
-		r.Reset(nil)
-		readerPool.Put(r)
-		if cap(scratch) <= 1<<20 {
-			scratchPool.Put(scratch[:0])
-		}
-	}()
+	r := bufio.NewReaderSize(conn, 8192)
+	var scratch []byte
 	for {
 		q, length, chunked, expect, closeAfter, err := readRequest(r)
 		if err != nil {
@@ -186,63 +165,16 @@ func (f *forge) serve(conn *net.TCPConn) {
 			return
 		}
 		q.body = scratch
-		revision := f.revision.Load()
-		var result response
-		cacheable := q.method == "GET" && len(q.body) == 0
-		if cacheable && previousResponse != nil && previousRevision == revision && sameRead(q, previous) {
-			result = previousResponse
-		} else {
-			result = f.dispatch(q)
-			if cacheable && f.revision.Load() == revision {
-				previous, previousResponse, previousRevision = q, result, revision
-				previous.body = nil
-			} else {
-				previousResponse = nil
-			}
-		}
-		if _, err = conn.Write(result); err != nil || closeAfter {
+		if _, err = conn.Write(f.dispatch(q)); err != nil || closeAfter {
 			return
 		}
 		if cap(scratch) > 1<<20 {
-			scratch = make([]byte, 0, 64<<10)
+			scratch = nil
 		}
 	}
 }
 
 var invalidWire = fmt.Errorf("invalid HTTP request")
-
-// A connection can reuse an immutable GET response only for the same complete
-// routing and authentication inputs, with no intervening store mutation.
-func sameRead(a, b request) bool {
-	return a.method == b.method && a.path == b.path && a.query == b.query &&
-		a.authorization == b.authorization && a.gitProtocol == b.gitProtocol && a.host == b.host
-}
-
-func headerName(key []byte) string {
-	var name string
-	switch len(key) {
-	case 4:
-		name = "host"
-	case 6:
-		name = "expect"
-	case 10:
-		name = "connection"
-	case 12:
-		name = "git-protocol"
-	case 13:
-		name = "authorization"
-	case 14:
-		name = "content-length"
-	case 17:
-		name = "transfer-encoding"
-	default:
-		return ""
-	}
-	if bytes.EqualFold(key, []byte(name)) {
-		return name
-	}
-	return ""
-}
 
 func readRequest(r *bufio.Reader) (q request, size int, chunked, expect, closeAfter bool, err error) {
 	line, err := r.ReadSlice('\n')
@@ -290,7 +222,7 @@ func readRequest(r *bufio.Reader) (q request, size int, chunked, expect, closeAf
 			}
 		}
 		val = bytes.TrimSpace(val)
-		switch headerName(key) {
+		switch strings.ToLower(string(key)) {
 		case "authorization":
 			q.authorization = string(val)
 		case "git-protocol":
@@ -410,11 +342,6 @@ func runTrial(origin string, port int) error {
 }
 
 func main() {
-	// One scheduler avoids competing workers spinning while the client shares
-	// a CPU quota with this server. Socket handlers still yield on network I/O.
-	runtime.GOMAXPROCS(1)
-	debug.SetGCPercent(800)
-	debug.SetMemoryLimit(768 << 20)
 	address := "0.0.0.0:0"
 	if runtime.GOOS == "windows" || os.Getenv("MAKEFUN_ENV_URL") == "" {
 		address = "127.0.0.1:0"

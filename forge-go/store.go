@@ -19,7 +19,6 @@ type forge struct {
 	mu           sync.RWMutex
 	repos        map[string]*repository
 	nextID       atomic.Int64
-	revision     atomic.Uint64
 }
 
 type repository struct {
@@ -34,38 +33,16 @@ type repository struct {
 	pulls                            map[int]*pull
 	nextNumber, nextComment          int
 	shallow                          atomic.Pointer[cloneFrame]
-	frames                           atomic.Pointer[repoFrames]
+	issueLists                       atomic.Pointer[issueListFrame]
 	readIndex                        sync.Map
 }
 
-type repoFrames struct {
-	values map[string]response
+// Keep just the latest list variant. Readers load immutable bytes atomically;
+// mutation drops that pointer while holding the repository's write lock.
+type issueListFrame struct {
+	key  string
+	body response
 }
-
-func (r *repository) cachedFrame(key string) response {
-	if cached := r.frames.Load(); cached != nil {
-		return cached.values[key]
-	}
-	return nil
-}
-
-func (r *repository) storeFrame(key string, value response) {
-	for {
-		cached := r.frames.Load()
-		values := make(map[string]response)
-		if cached != nil {
-			for k, v := range cached.values {
-				values[k] = v
-			}
-		}
-		values[key] = value
-		if r.frames.CompareAndSwap(cached, &repoFrames{values: values}) {
-			return
-		}
-	}
-}
-
-func (r *repository) invalidateFrames() { r.frames.Store(nil) }
 
 type issue struct {
 	id, nodeID, title, body, state string
@@ -73,6 +50,7 @@ type issue struct {
 	labels                         []obj
 	comments                       []obj
 	view                           obj
+	json                           []byte
 	read                           response
 }
 
@@ -232,35 +210,19 @@ func (f *forge) rest(q request) response {
 		}
 		return notFound
 	}
-	if q.method == "GET" && (action == "issues" || action == "pulls") {
-		values, _ := url.ParseQuery(q.query)
-		cacheKey := action + ":" + q.host + "?" + q.query
-		if cached := r.cachedFrame(cacheKey); cached != nil {
-			return cached
+	if q.method == "GET" && action == "issues" {
+		cacheKey := q.host + q.path + "?" + q.query
+		if cached := r.issueLists.Load(); cached != nil && cached.key == cacheKey {
+			return cached.body
 		}
 		r.mu.RLock()
 		defer r.mu.RUnlock()
-		if cached := r.cachedFrame(cacheKey); cached != nil {
-			return cached
+		if cached := r.issueLists.Load(); cached != nil && cached.key == cacheKey {
+			return cached.body
 		}
-		var result response
-		if action == "issues" {
-			result = paginate(q, values, r.issueList(values))
-		} else {
-			state := values.Get("state")
-			if state == "" {
-				state = "open"
-			}
-			list := make([]obj, 0, len(r.pulls))
-			for _, p := range r.pulls {
-				if state == "all" || state == p.state {
-					list = append(list, r.pullView(p))
-				}
-			}
-			sort.Slice(list, func(i, j int) bool { return integer(list[i]["number"]) > integer(list[j]["number"]) })
-			result = paginate(q, values, list)
-		}
-		r.storeFrame(cacheKey, result)
+		values, _ := url.ParseQuery(q.query)
+		result := r.serializedIssues(q, values)
+		r.issueLists.Store(&issueListFrame{cacheKey, result})
 		return result
 	}
 	if action == "" && q.method == "DELETE" {
@@ -282,7 +244,6 @@ func (f *forge) rest(q request) response {
 			if branch, ok := input["default_branch"].(string); ok && r.refs["refs/heads/"+branch] != zero {
 				r.branch = branch
 			}
-			r.invalidateFrames()
 			return jsonFrame(200, "", r.view())
 		}
 		return notFound
@@ -294,7 +255,6 @@ func (f *forge) rest(q request) response {
 			return problem(422, "Invalid reference")
 		}
 		r.refs[name] = id
-		r.invalidateFrames()
 		return jsonFrame(201, "", obj{"ref": name, "object": obj{"sha": id.String(), "type": "commit"}})
 	}
 	if strings.HasPrefix(action, "git/ref/") && q.method == "GET" {
@@ -362,8 +322,7 @@ func (f *forge) rest(q request) response {
 			status, value := r.createIssue(input)
 			if status == 201 {
 				// refreshIssue already encoded this object for subsequent GETs.
-				_, body, _ := bytes.Cut(r.issues[r.nextNumber].read, []byte("\r\n\r\n"))
-				return frame(status, "application/json", "", body)
+				return frame(status, "application/json", "", r.issues[r.nextNumber].json)
 			}
 			return jsonFrame(status, "", value)
 		}
@@ -404,6 +363,20 @@ func (f *forge) rest(q request) response {
 		if q.method == "POST" {
 			status, value := r.createPull(input)
 			return jsonFrame(status, "", value)
+		}
+		if q.method == "GET" {
+			state := values.Get("state")
+			if state == "" {
+				state = "open"
+			}
+			list := make([]obj, 0, len(r.pulls))
+			for _, p := range r.pulls {
+				if state == "all" || state == p.state {
+					list = append(list, r.pullView(p))
+				}
+			}
+			sort.Slice(list, func(i, j int) bool { return integer(list[i]["number"]) > integer(list[j]["number"]) })
+			return paginate(q, values, list)
 		}
 	}
 	if strings.HasPrefix(action, "pulls/") {
@@ -529,7 +502,6 @@ func (r *repository) contents(q request, input obj, values url.Values, name stri
 	}
 	id := r.commitFiles(files, parent, text(input["message"]), r.owner)
 	r.refs["refs/heads/"+branch] = id
-	r.invalidateFrames()
 	status := 200
 	var content any
 	if q.method != "DELETE" {
@@ -548,8 +520,43 @@ func (r *repository) issueBase(i *issue) obj {
 func (r *repository) refreshIssue(i *issue) {
 	i.view = r.issueBase(i)
 	i.read = jsonFrame(200, "", i.view)
+	_, i.json, _ = bytes.Cut(i.read, []byte("\r\n\r\n"))
 	r.readIndex.Store(i.number, i.read)
-	r.invalidateFrames()
+	r.issueLists.Store(nil)
+}
+
+func (r *repository) serializedIssues(q request, values url.Values) response {
+	state := values.Get("state")
+	if state == "" {
+		state = "open"
+	}
+	list := make([]*issue, 0, len(r.issues))
+	for _, i := range r.issues {
+		if state == "all" || i.state == state {
+			list = append(list, i)
+		}
+	}
+	asc := values.Get("direction") == "asc"
+	sort.Slice(list, func(i, j int) bool {
+		if asc {
+			return list[i].number < list[j].number
+		}
+		return list[i].number > list[j].number
+	})
+	w := window(values, len(list))
+	headers := ""
+	if w.end < len(list) {
+		values.Set("page", strconv.Itoa(w.page+1))
+		headers = "Link: <http://" + q.host + q.path + "?" + values.Encode() + ">; rel=\"next\"\r\n"
+	}
+	body := []byte{'['}
+	for index, i := range list[w.start:w.end] {
+		if index > 0 {
+			body = append(body, ',')
+		}
+		body = append(body, i.json...)
+	}
+	return frame(200, "application/json", headers, append(body, ']'))
 }
 
 func (r *repository) createIssue(input obj) (int, any) {
@@ -622,7 +629,6 @@ func (r *repository) createPull(input obj) (int, any) {
 	n := r.nextNumber
 	p := &pull{issue: issue{id: strconv.FormatInt(r.id, 10) + "-" + strconv.Itoa(n), nodeID: globalID("PullRequest", r.id, n), number: n, title: text(input["title"]), body: text(input["body"]), state: "open", labels: []obj{}, comments: []obj{}}, head: head, base: base, headID: headID, baseID: baseID, forkID: r.mergeBase(baseID, headID)}
 	r.pulls[n] = p
-	r.invalidateFrames()
 	return 201, r.pullView(p)
 }
 
@@ -732,7 +738,6 @@ func (r *repository) mergePull(p *pull) (int, any) {
 	id := r.commitFiles(files, parent, p.title+"\n\n"+p.body, r.owner)
 	r.refs["refs/heads/"+p.base] = id
 	p.mergeID, p.merged, p.state = id, true, "closed"
-	r.invalidateFrames()
 	return 200, obj{"sha": id.String(), "merged": true, "message": "Pull request successfully merged"}
 }
 
