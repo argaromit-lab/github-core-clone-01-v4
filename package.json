@@ -1,0 +1,16 @@
+{
+  "name": "github-core-clone-01-v4",
+  "version": "2.0.0",
+  "type": "module",
+  "private": true,
+  "description": "A compact, standalone GitHub-compatible forge with one shared in-memory store.",
+  "license": "MIT",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build-windows": "node scripts/build.mjs --windows",
+    "practice": "node scripts/practice.mjs"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
