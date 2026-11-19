@@ -1,6 +1,6 @@
 import { chmod, copyFile, access } from 'node:fs/promises';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, constants } from 'node:fs';
+import { accessSync, constants, existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { arch, platform } from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -14,11 +14,15 @@ if (!targetArch) throw new Error(`Unsupported architecture: ${arch}`);
 let executable;
 let temporaryDirectory = '';
 if (platform === 'linux') {
-  executable = new URL(`bin/forge-linux-${targetArch}`, root);
-  const staged = '/tmp/forge-bin';
-  await copyFile(executable, staged);
-  await chmod(staged, 0o755);
-  executable = staged;
+  executable = fileURLToPath(new URL(`bin/forge-linux-${targetArch}`, root));
+  try {
+    accessSync(executable, constants.X_OK);
+  } catch {
+    const staged = '/tmp/forge-bin';
+    await copyFile(executable, staged);
+    await chmod(staged, 0o755);
+    executable = staged;
+  }
 } else if (platform === 'win32') {
   executable = fileURLToPath(new URL(`bin/forge-windows-${targetArch}.exe`, root));
   try {

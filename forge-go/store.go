@@ -19,6 +19,7 @@ type forge struct {
 	mu           sync.RWMutex
 	repos        map[string]*repository
 	nextID       atomic.Int64
+	revision     atomic.Uint64
 }
 
 type repository struct {
@@ -33,10 +34,38 @@ type repository struct {
 	pulls                            map[int]*pull
 	nextNumber, nextComment          int
 	shallow                          atomic.Pointer[cloneFrame]
+	frames                           atomic.Pointer[repoFrames]
 	readIndex                        sync.Map
-	listCache                        map[string]response
-	version                          int
 }
+
+type repoFrames struct {
+	values map[string]response
+}
+
+func (r *repository) cachedFrame(key string) response {
+	if cached := r.frames.Load(); cached != nil {
+		return cached.values[key]
+	}
+	return nil
+}
+
+func (r *repository) storeFrame(key string, value response) {
+	for {
+		cached := r.frames.Load()
+		values := make(map[string]response)
+		if cached != nil {
+			for k, v := range cached.values {
+				values[k] = v
+			}
+		}
+		values[key] = value
+		if r.frames.CompareAndSwap(cached, &repoFrames{values: values}) {
+			return
+		}
+	}
+}
+
+func (r *repository) invalidateFrames() { r.frames.Store(nil) }
 
 type issue struct {
 	id, nodeID, title, body, state string
@@ -101,7 +130,7 @@ func (f *forge) createRepo(input obj) (int, any) {
 		return 422, obj{"message": "Invalid branch"}
 	}
 	private, _ := input["private"].(bool)
-	r := &repository{id: f.nextID.Add(1), name: name, owner: f.login, branch: branch, description: text(input["description"]), private: private, objects: map[oid]*gitObject{}, refs: map[string]oid{}, labels: map[string]obj{}, issues: map[int]*issue{}, pulls: map[int]*pull{}, listCache: map[string]response{}}
+	r := &repository{id: f.nextID.Add(1), name: name, owner: f.login, branch: branch, description: text(input["description"]), private: private, objects: map[oid]*gitObject{}, refs: map[string]oid{}, labels: map[string]obj{}, issues: map[int]*issue{}, pulls: map[int]*pull{}}
 	if input["auto_init"] == true {
 		blob := r.saveObject(blobKind, []byte("# "+name+"\n"))
 		id := r.commitFiles(map[string]treeEntry{"README.md": {"README.md", "100644", blob}}, zero, "Initial commit", f.login)
@@ -197,11 +226,42 @@ func (f *forge) rest(q request) response {
 	if q.method == "GET" && strings.HasPrefix(action, "issues/") && !strings.Contains(action[7:], "/") {
 		n, err := strconv.Atoi(action[7:])
 		if err == nil {
-			if v, found := r.readIndex.Load(n); found {
-				return v.(response)
+			if cached, found := r.readIndex.Load(n); found {
+				return cached.(response)
 			}
 		}
 		return notFound
+	}
+	if q.method == "GET" && (action == "issues" || action == "pulls") {
+		values, _ := url.ParseQuery(q.query)
+		cacheKey := action + ":" + q.host + "?" + q.query
+		if cached := r.cachedFrame(cacheKey); cached != nil {
+			return cached
+		}
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		if cached := r.cachedFrame(cacheKey); cached != nil {
+			return cached
+		}
+		var result response
+		if action == "issues" {
+			result = paginate(q, values, r.issueList(values))
+		} else {
+			state := values.Get("state")
+			if state == "" {
+				state = "open"
+			}
+			list := make([]obj, 0, len(r.pulls))
+			for _, p := range r.pulls {
+				if state == "all" || state == p.state {
+					list = append(list, r.pullView(p))
+				}
+			}
+			sort.Slice(list, func(i, j int) bool { return integer(list[i]["number"]) > integer(list[j]["number"]) })
+			result = paginate(q, values, list)
+		}
+		r.storeFrame(cacheKey, result)
+		return result
 	}
 	if action == "" && q.method == "DELETE" {
 		f.mu.Lock()
@@ -222,6 +282,7 @@ func (f *forge) rest(q request) response {
 			if branch, ok := input["default_branch"].(string); ok && r.refs["refs/heads/"+branch] != zero {
 				r.branch = branch
 			}
+			r.invalidateFrames()
 			return jsonFrame(200, "", r.view())
 		}
 		return notFound
@@ -233,6 +294,7 @@ func (f *forge) rest(q request) response {
 			return problem(422, "Invalid reference")
 		}
 		r.refs[name] = id
+		r.invalidateFrames()
 		return jsonFrame(201, "", obj{"ref": name, "object": obj{"sha": id.String(), "type": "commit"}})
 	}
 	if strings.HasPrefix(action, "git/ref/") && q.method == "GET" {
@@ -298,17 +360,12 @@ func (f *forge) rest(q request) response {
 	if action == "issues" {
 		if q.method == "POST" {
 			status, value := r.createIssue(input)
-			return jsonFrame(status, "", value)
-		}
-		if q.method == "GET" {
-			cacheKey := q.host + "?" + q.query
-			if cached := r.listCache[cacheKey]; cached != nil {
-				return cached
+			if status == 201 {
+				// refreshIssue already encoded this object for subsequent GETs.
+				_, body, _ := bytes.Cut(r.issues[r.nextNumber].read, []byte("\r\n\r\n"))
+				return frame(status, "application/json", "", body)
 			}
-			list := r.issueList(values)
-			result := paginate(q, values, list)
-			r.listCache[cacheKey] = result
-			return result
+			return jsonFrame(status, "", value)
 		}
 	}
 	if strings.HasPrefix(action, "issues/") {
@@ -347,20 +404,6 @@ func (f *forge) rest(q request) response {
 		if q.method == "POST" {
 			status, value := r.createPull(input)
 			return jsonFrame(status, "", value)
-		}
-		if q.method == "GET" {
-			state := values.Get("state")
-			if state == "" {
-				state = "open"
-			}
-			list := make([]obj, 0, len(r.pulls))
-			for _, p := range r.pulls {
-				if state == "all" || state == p.state {
-					list = append(list, r.pullView(p))
-				}
-			}
-			sort.Slice(list, func(i, j int) bool { return integer(list[i]["number"]) > integer(list[j]["number"]) })
-			return paginate(q, values, list)
 		}
 	}
 	if strings.HasPrefix(action, "pulls/") {
@@ -486,6 +529,7 @@ func (r *repository) contents(q request, input obj, values url.Values, name stri
 	}
 	id := r.commitFiles(files, parent, text(input["message"]), r.owner)
 	r.refs["refs/heads/"+branch] = id
+	r.invalidateFrames()
 	status := 200
 	var content any
 	if q.method != "DELETE" {
@@ -505,8 +549,7 @@ func (r *repository) refreshIssue(i *issue) {
 	i.view = r.issueBase(i)
 	i.read = jsonFrame(200, "", i.view)
 	r.readIndex.Store(i.number, i.read)
-	r.listCache = make(map[string]response)
-	r.version++
+	r.invalidateFrames()
 }
 
 func (r *repository) createIssue(input obj) (int, any) {
@@ -579,6 +622,7 @@ func (r *repository) createPull(input obj) (int, any) {
 	n := r.nextNumber
 	p := &pull{issue: issue{id: strconv.FormatInt(r.id, 10) + "-" + strconv.Itoa(n), nodeID: globalID("PullRequest", r.id, n), number: n, title: text(input["title"]), body: text(input["body"]), state: "open", labels: []obj{}, comments: []obj{}}, head: head, base: base, headID: headID, baseID: baseID, forkID: r.mergeBase(baseID, headID)}
 	r.pulls[n] = p
+	r.invalidateFrames()
 	return 201, r.pullView(p)
 }
 
@@ -688,6 +732,7 @@ func (r *repository) mergePull(p *pull) (int, any) {
 	id := r.commitFiles(files, parent, p.title+"\n\n"+p.body, r.owner)
 	r.refs["refs/heads/"+p.base] = id
 	p.mergeID, p.merged, p.state = id, true, "closed"
+	r.invalidateFrames()
 	return 200, obj{"sha": id.String(), "merged": true, "message": "Pull request successfully merged"}
 }
 

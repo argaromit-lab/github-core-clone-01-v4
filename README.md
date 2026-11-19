@@ -26,6 +26,8 @@ npm run practice
 
 The implementation includes protocol-v2 upload-pack, report-status receive-pack, native Git object hashing and pack parsing, shallow/deepening fetches, commit-backed contents and merges, stable GraphQL identities, and Streamable HTTP MCP tools.
 
+The [Linux benchmark report](BENCHMARK.md) records three practice trials with live/replay checks under a shared Docker limit of 1 CPU and 1024 MB. The final mean score was 978.33 at 252,943 microseconds; the 210,000-microsecond target remains unmet. It also includes the commands to reproduce the run.
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
